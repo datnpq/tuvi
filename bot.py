@@ -2,6 +2,9 @@ import os
 import logging
 import re
 import time
+import json
+import random
+import threading
 from datetime import datetime
 from dotenv import load_dotenv
 import requests
@@ -22,6 +25,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import uuid
 import json
+import threading
+import random
 
 # Tải biến môi trường từ file .env
 load_dotenv()
@@ -126,56 +131,6 @@ def send_stats_to_admin(admin_id):
     except Exception as e:
         logger.error(f"Lỗi khi gửi thống kê cho admin: {e}")
 
-# Phương án dự phòng nếu vẫn không kết nối được
-def create_temporary_database():
-    """Tạo cơ sở dữ liệu tạm thời bằng SQLite nếu không kết nối được Supabase"""
-    try:
-        import sqlite3
-        logger.info("Tạo cơ sở dữ liệu SQLite tạm thời")
-        
-        # Tạo thư mục data nếu chưa tồn tại
-        if not os.path.exists('data'):
-            os.makedirs('data')
-        
-        # Kết nối đến database SQLite
-        conn = sqlite3.connect('data/tuvi_temp.db')
-        cursor = conn.cursor()
-        
-        # Tạo bảng users
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER UNIQUE NOT NULL,
-                first_name TEXT,
-                last_name TEXT,
-                username TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Tạo bảng charts
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS charts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                day INTEGER NOT NULL,
-                month INTEGER NOT NULL,
-                year INTEGER NOT NULL,
-                birth_time TEXT NOT NULL,
-                gender TEXT NOT NULL,
-                chart_image TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(telegram_id)
-            )
-        ''')
-        
-        conn.commit()
-        logger.info("Đã khởi tạo cơ sở dữ liệu SQLite thành công")
-        return conn
-    except Exception as e:
-        logger.error(f"Lỗi khi tạo cơ sở dữ liệu tạm thời: {e}")
-        return None
-
 # Hàm kết nối đến Supabase với nhiều phương thức thử khác nhau
 def get_db_connection():
     # Danh sách các cấu hình kết nối để thử
@@ -276,8 +231,12 @@ def init_database():
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    """Bắt đầu hội thoại và yêu cầu ngày tháng năm sinh."""
+    """Bắt đầu hội thoại."""
     chat_id = message.chat.id
+    
+    # Clear any existing state for this user
+    if chat_id in user_states:
+        del user_states[chat_id]
     
     # Lưu thông tin người dùng vào cơ sở dữ liệu
     save_user(message.from_user)
@@ -375,94 +334,126 @@ def get_birth_date(message):
         parse_mode='Markdown'
     )
 
-@bot.callback_query_handler(func=lambda call: True)
-def get_birth_time(call):
-    """Nhận giờ sinh và hỏi giới tính."""
+@bot.callback_query_handler(func=lambda call: call.data in ["analyze", "cancel_analysis"])
+def handle_analysis_callbacks(call):
+    """Handle analysis-related callbacks."""
     chat_id = call.message.chat.id
     
-    if isinstance(user_states.get(chat_id), dict) and user_states[chat_id].get('state') == WAITING_FOR_BIRTH_TIME:
-        time_mapping = {
-            "ty": "Tý", "suu": "Sửu", "dan": "Dần", "mao": "Mão", 
-            "thin": "Thìn", "ty_hora": "Tỵ", "ngo": "Ngọ", "mui": "Mùi", 
-            "than": "Thân", "dau": "Dậu", "tuat": "Tuất", "hoi": "Hợi",
-            "unknown": "Không rõ"
-        }
-        
-        # Nếu callback data là "analyze" hoặc "cancel_analysis", xử lý phân tích
-        if call.data == "analyze":
-            # Xử lý phân tích lá số tử vi
-            process_analysis(chat_id)
-            return
-        elif call.data == "cancel_analysis":
-            bot.send_message(
-                chat_id, 
-                "✅ Đã hủy phân tích. Bạn có thể gõ /start để lập lá số tử vi mới.",
-                parse_mode='Markdown'
-            )
-            del user_states[chat_id]
-            return
-        elif call.data == "male":
-            # Người dùng chọn giới tính Nam
-            user_states[chat_id]['gender'] = "Nam"
-            process_tuvi_chart(chat_id)
-            return
-        elif call.data == "female":
-            # Người dùng chọn giới tính Nữ
-            user_states[chat_id]['gender'] = "Nữ"
-            process_tuvi_chart(chat_id)
-            return
-        
-        birth_time = time_mapping.get(call.data, "Không rõ")
-        user_states[chat_id]['birth_time'] = birth_time
-        
-        # Thông báo đã chọn giờ sinh
-        try:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=call.message.message_id,
-                text=f"✅ Bạn đã chọn giờ sinh: *{birth_time}*",
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.warning(f"Không thể cập nhật tin nhắn: {e}")
-            # Gửi tin nhắn mới nếu không thể cập nhật tin nhắn cũ
-            try:
-                bot.send_message(
-                    chat_id,
-                    f"✅ Bạn đã chọn giờ sinh: *{birth_time}*",
-                    parse_mode='Markdown'
-                )
-            except Exception as e2:
-                logger.error(f"Không thể gửi tin nhắn xác nhận giờ sinh: {e2}")
-        
-        # Tạo bàn phím inline để chọn giới tính
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        btn_male = types.InlineKeyboardButton("👨 Nam", callback_data="male")
-        btn_female = types.InlineKeyboardButton("👩 Nữ", callback_data="female")
-        markup.add(btn_male, btn_female)
-        
+    if call.data == "analyze":
+        # Process chart analysis
+        process_analysis(chat_id)
+    elif call.data == "cancel_analysis":
         bot.send_message(
-            chat_id,
-            "👫 *Vui lòng chọn giới tính:*",
-            reply_markup=markup,
+            chat_id, 
+            "✅ Đã hủy phân tích. Bạn có thể gõ /start để lập lá số tử vi mới.",
             parse_mode='Markdown'
         )
-    else:
-        # Xử lý trường hợp callback không hợp lệ
+        # Clear user state
+        if chat_id in user_states:
+            del user_states[chat_id]
+    
+    # Acknowledge the callback
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["male", "female"])
+def handle_gender_selection(call):
+    """Handle gender selection callbacks."""
+    chat_id = call.message.chat.id
+    
+    # Verify the user is in the correct state
+    if chat_id not in user_states or 'state' not in user_states[chat_id] or user_states[chat_id]['state'] != WAITING_FOR_BIRTH_TIME:
+        bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        return
+    
+    if call.data == "male":
+        user_states[chat_id]['gender'] = "Nam"
+    else:  # female
+        user_states[chat_id]['gender'] = "Nữ"
+    
+    # Process the chart
+    process_tuvi_chart(chat_id)
+    
+    # Acknowledge the callback
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["ty", "suu", "dan", "mao", "thin", "ty_hora", "ngo", "mui", "than", "dau", "tuat", "hoi", "unknown"])
+def handle_birth_time(call):
+    """Handle birth time selection callbacks."""
+    chat_id = call.message.chat.id
+    
+    # Verify the user is in the correct state
+    if chat_id not in user_states or 'state' not in user_states[chat_id] or user_states[chat_id]['state'] != WAITING_FOR_BIRTH_TIME:
+        bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        return
+    
+    time_mapping = {
+        "ty": "Tý", "suu": "Sửu", "dan": "Dần", "mao": "Mão", 
+        "thin": "Thìn", "ty_hora": "Tỵ", "ngo": "Ngọ", "mui": "Mùi", 
+        "than": "Thân", "dau": "Dậu", "tuat": "Tuất", "hoi": "Hợi",
+        "unknown": "Không rõ"
+    }
+    
+    birth_time = time_mapping.get(call.data, "Không rõ")
+    user_states[chat_id]['birth_time'] = birth_time
+    
+    # Thông báo đã chọn giờ sinh
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=f"✅ Bạn đã chọn giờ sinh: *{birth_time}*",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning(f"Không thể cập nhật tin nhắn: {e}")
+        # Gửi tin nhắn mới nếu không thể cập nhật tin nhắn cũ
         try:
-            # Kiểm tra xem callback có phải là từ một nút phân tích hoặc xem lá số không
-            if call.data.startswith("analyze_chart_") or call.data.startswith("view_chart_") or call.data.startswith("detail_"):
-                # Để các hàm xử lý callback khác xử lý
-                return
-            
-            # Thông báo lỗi nếu không phải callback hợp lệ
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.",
-                show_alert=True
+            bot.send_message(
+                chat_id,
+                f"✅ Bạn đã chọn giờ sinh: *{birth_time}*",
+                parse_mode='Markdown'
             )
-        except Exception as e:
-            logger.error(f"Lỗi khi xử lý callback không hợp lệ: {e}")
+        except Exception as e2:
+            logger.error(f"Không thể gửi tin nhắn xác nhận giờ sinh: {e2}")
+    
+    # Tạo bàn phím inline để chọn giới tính
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    btn_male = types.InlineKeyboardButton("👨 Nam", callback_data="male")
+    btn_female = types.InlineKeyboardButton("👩 Nữ", callback_data="female")
+    markup.add(btn_male, btn_female)
+    
+    bot.send_message(
+        chat_id,
+        "👫 *Vui lòng chọn giới tính:*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+    
+    # Acknowledge the callback
+    bot.answer_callback_query(call.id)
+
+# Replace the old catch-all callback handler with a fallback handler
+@bot.callback_query_handler(func=lambda call: True)
+def handle_other_callbacks(call):
+    """Handle any other callbacks that weren't caught by specific handlers."""
+    chat_id = call.message.chat.id
+    
+    # Check if it's a cung selection callback
+    if call.data.startswith("cung_"):
+        # Let the cung selection handler handle it
+        return
+    
+    # Check if it's a chart analysis or view callback
+    if call.data.startswith("analyze_chart_") or call.data.startswith("view_chart_") or call.data.startswith("detail_"):
+        # Let other handlers handle these
+        return
+    
+    # For any other unhandled callbacks
+    bot.answer_callback_query(
+        call.id,
+        "⚠️ Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.",
+        show_alert=True
+    )
 
 def process_tuvi_chart(chat_id):
     """Xử lý lá số tử vi."""
@@ -492,6 +483,10 @@ def process_tuvi_chart(chat_id):
             logger.warning(f"Không thể xóa tin nhắn đang xử lý: {e}")
         
         # Lưu đường dẫn kết quả vào trạng thái người dùng
+        # Xóa trạng thái WAITING_FOR_BIRTH_TIME vì đã hoàn thành bước này
+        if 'state' in user_states[chat_id]:
+            del user_states[chat_id]['state']
+            
         if result_path.endswith('.html'):
             user_states[chat_id]['chart_html_path'] = result_path
         else:
@@ -860,47 +855,72 @@ def analyze_chart_with_gpt(chart_path, user_data):
         user_data (dict): Thông tin người dùng
         
     Returns:
-        str: Kết quả phân tích
+        dict: Kết quả phân tích theo từng cung
     """
     try:
         # Kiểm tra xem file có tồn tại không
         if not os.path.exists(chart_path):
             logger.error(f"File không tồn tại: {chart_path}")
-            return "Không tìm thấy lá số để phân tích. Vui lòng thử lại."
+            return {"error": "Không tìm thấy lá số để phân tích. Vui lòng thử lại."}
         
         # Đọc file hình ảnh và chuyển sang base64
         with open(chart_path, 'rb') as img_file:
             base64_image = base64.b64encode(img_file.read()).decode('utf-8')
         
         # Lấy thông tin từ user_data
-        name = user_data.get('name', 'Không xác định')
-        birth_date = user_data.get('birth_date', 'Không xác định')
+        day = user_data.get('day', 'Không xác định')
+        month = user_data.get('month', 'Không xác định')
+        year = user_data.get('year', 'Không xác định')
         birth_time = user_data.get('birth_time', 'Không xác định')
         gender = user_data.get('gender', 'Không xác định')
         
-        # Chuẩn bị prompt
-        system_prompt = """Bạn là một nhà chiêm tinh học chuyên nghiệp với kiến thức sâu rộng về tử vi Việt Nam. 
-        Hãy phân tích lá số tử vi trong hình ảnh được cung cấp và đưa ra những nhận định chính xác, chi tiết.
-        Phân tích nên bao gồm:
-        1. Tổng quan về mệnh cục
-        2. Phân tích các sao chính và vị trí của chúng
-        3. Phân tích các cung quan trọng (Mệnh, Tài, Quan, Phu/Thê)
-        4. Các góc hợp đáng chú ý và ý nghĩa của chúng
-        5. Những điểm mạnh và điểm yếu trong lá số
-        6. Lời khuyên dựa trên lá số
+        # Chuẩn bị prompt để phân tích tổng quan
+        system_prompt = """Bạn là người bạn thân thiện, hiểu biết về tử vi Việt Nam. 
+        Hãy xem và phân tích lá số tử vi trong hình ảnh một cách đơn giản, dễ hiểu và gần gũi.
         
-        Hãy viết bằng tiếng Việt, thân thiện và dễ hiểu. Đảm bảo phân tích sâu sắc nhưng không quá phức tạp để người dùng có thể hiểu được."""
+        Phân tích lá số tử vi theo các cung sau:
+        1. Tổng quan: Nhận xét chung về cuộc đời người này
+        2. Cung Mệnh: Tính cách, đặc điểm bản thân, vận mệnh chung
+        3. Cung Phúc Đức: May mắn, phúc báo, hậu vận
+        4. Cung Tài Bạch: Tiền bạc, tài lộc, cách kiếm tiền
+        5. Cung Quan Lộc: Sự nghiệp, công danh, địa vị xã hội
+        6. Cung Phu Thê: Hôn nhân, người phối ngẫu
+        7. Cung Tử Tức: Con cái, mối quan hệ với con
+        8. Cung Huynh Đệ: Anh chị em, bạn bè, đồng nghiệp
+        9. Cung Điền Trạch: Nhà cửa, bất động sản
+        10. Cung Thiên Di: Du lịch, xa quê, cơ hội ở nơi xa
+        11. Cung Nô Bộc: Cấp dưới, người giúp việc, đối tác
+        12. Cung Tật Ách: Sức khỏe, bệnh tật, tai ương
         
-        # Tạo nội dung user prompt
-        user_prompt = f"""Thông tin cá nhân:
-        - Tên: {name}
-        - Ngày sinh: {birth_date}
+        Hãy trả lời theo định dạng JSON với cấu trúc sau:
+        {
+          "tong_quan": "Phân tích tổng quan về lá số",
+          "cung_menh": "Phân tích về cung Mệnh",
+          "cung_phuc_duc": "Phân tích về cung Phúc Đức",
+          "cung_tai_bach": "Phân tích về cung Tài Bạch",
+          "cung_quan_loc": "Phân tích về cung Quan Lộc",
+          "cung_phu_the": "Phân tích về cung Phu Thê",
+          "cung_tu_tuc": "Phân tích về cung Tử Tức",
+          "cung_huynh_de": "Phân tích về cung Huynh Đệ",
+          "cung_dien_trach": "Phân tích về cung Điền Trạch",
+          "cung_thien_di": "Phân tích về cung Thiên Di",
+          "cung_no_boc": "Phân tích về cung Nô Bộc",
+          "cung_tat_ach": "Phân tích về cung Tật Ách"
+        }
+        
+        Mỗi phần phân tích nên ngắn gọn, dễ hiểu, thân thiện và có ít nhất một emoji phù hợp.
+        Đừng sử dụng ngôn ngữ quá chuyên môn. Hãy nói chuyện như một người bạn đang chia sẻ.
+        Hãy viết bằng tiếng Việt, giọng điệu thân thiện, đơn giản và dễ hiểu."""
+        
+        # Tạo nội dung user prompt đơn giản
+        user_prompt = f"""Xem tử vi cho tui với:
+        - Ngày sinh: {day}/{month}/{year}
         - Giờ sinh: {birth_time}
         - Giới tính: {gender}
         
-        Hình ảnh đính kèm là lá số tử vi. Hãy phân tích lá số này một cách chi tiết."""
+        Hình ảnh đính kèm là lá số tử vi của tui. Cảm ơn bạn nhiều!"""
         
-        logger.info(f"Đang phân tích lá số cho người dùng: {name}")
+        logger.info(f"Đang phân tích lá số cho người sinh ngày {day}/{month}/{year}")
         
         # Gọi API để lấy phân tích
         response = openai_client.chat.completions.create(
@@ -913,65 +933,169 @@ def analyze_chart_with_gpt(chart_path, user_data):
                 ]}
             ],
             temperature=0.7,
-            max_tokens=2000
+            max_tokens=3000
         )
         
-        # Trích xuất và trả về phân tích
-        analysis = response.choices[0].message.content
+        # Trích xuất phân tích
+        analysis_text = response.choices[0].message.content
         logger.info(f"AIRouter đã phân tích xong lá số, model: {response.model}")
-        return analysis
+        
+        # Chuyển đổi phân tích từ JSON sang dict
+        try:
+            # Tìm và trích xuất phần JSON từ phản hồi
+            json_match = re.search(r'({[\s\S]*})', analysis_text)
+            if json_match:
+                analysis_json = json_match.group(1)
+                analysis_dict = json.loads(analysis_json)
+            else:
+                # Nếu không tìm thấy JSON, tạo dict thủ công
+                analysis_dict = {
+                    "tong_quan": "Không thể phân tích tổng quan. Vui lòng thử lại.",
+                    "error": "Không thể phân tích theo định dạng JSON. Vui lòng thử lại."
+                }
+                # Thêm phần phân tích thô vào để tham khảo
+                analysis_dict["raw_analysis"] = analysis_text
+        except json.JSONDecodeError as e:
+            logger.error(f"Lỗi khi phân tích JSON: {e}")
+            # Tạo dict thủ công nếu không thể phân tích JSON
+            analysis_dict = {
+                "tong_quan": "Không thể phân tích tổng quan. Vui lòng thử lại.",
+                "error": f"Lỗi khi phân tích JSON: {str(e)}",
+                "raw_analysis": analysis_text
+            }
+        
+        return analysis_dict
         
     except Exception as e:
         logger.error(f"Lỗi khi phân tích lá số: {e}")
-        return "Đã xảy ra lỗi khi phân tích lá số. Vui lòng thử lại sau."
+        return {
+            "error": f"Có lỗi xảy ra khi xem tử vi. Bạn thử lại sau nhé! Lỗi: {str(e)}"
+        }
 
-def format_analysis(analysis, user_data):
+def format_analysis(analysis_dict, user_data, cung=None):
     """
-    Định dạng kết quả phân tích từ AIRouter để hiển thị đẹp hơn.
+    Định dạng kết quả phân tích từ AIRouter để hiển thị đẹp hơn và thân thiện hơn.
     
     Args:
-        analysis (str): Phân tích từ API
+        analysis_dict (dict): Phân tích từ API dưới dạng dict
         user_data (dict): Thông tin người dùng
+        cung (str, optional): Tên cung cần hiển thị, nếu None thì hiển thị tổng quan
         
     Returns:
         str: Phân tích đã được định dạng
     """
     try:
-        # Thêm tiêu đề và thông tin người dùng
-        name = user_data.get('name', 'Không xác định')
-        birth_date = user_data.get('birth_date', 'Không xác định')
+        # Kiểm tra lỗi
+        if "error" in analysis_dict and cung != "tong_quan":
+            return f"❌ *Lỗi khi phân tích*\n\n{analysis_dict['error']}"
+        
+        # Lấy thông tin người dùng
+        day = user_data.get('day', 'Không xác định')
+        month = user_data.get('month', 'Không xác định')
+        year = user_data.get('year', 'Không xác định')
         birth_time = user_data.get('birth_time', 'Không xác định') 
         gender = user_data.get('gender', 'Không xác định')
         
-        formatted_text = f"""🔮 *PHÂN TÍCH LÁ SỐ TỬ VI*
+        # Ánh xạ tên cung
+        cung_mapping = {
+            "tong_quan": "Tổng Quan",
+            "cung_menh": "Cung Mệnh",
+            "cung_phuc_duc": "Cung Phúc Đức",
+            "cung_tai_bach": "Cung Tài Bạch",
+            "cung_quan_loc": "Cung Quan Lộc",
+            "cung_phu_the": "Cung Phu Thê",
+            "cung_tu_tuc": "Cung Tử Tức",
+            "cung_huynh_de": "Cung Huynh Đệ",
+            "cung_dien_trach": "Cung Điền Trạch",
+            "cung_thien_di": "Cung Thiên Di",
+            "cung_no_boc": "Cung Nô Bộc",
+            "cung_tat_ach": "Cung Tật Ách"
+        }
         
-📋 *Thông tin cá nhân*
-👤 Tên: {name}
-📅 Ngày sinh: {birth_date}
-🕰 Giờ sinh: {birth_time}
-⚧ Giới tính: {gender}
+        # Emoji cho từng cung
+        cung_emoji = {
+            "tong_quan": "🔮",
+            "cung_menh": "👤",
+            "cung_phuc_duc": "🙏",
+            "cung_tai_bach": "💰",
+            "cung_quan_loc": "💼",
+            "cung_phu_the": "💑",
+            "cung_tu_tuc": "👶",
+            "cung_huynh_de": "👥",
+            "cung_dien_trach": "🏠",
+            "cung_thien_di": "✈️",
+            "cung_no_boc": "👨‍👩‍👧‍👦",
+            "cung_tat_ach": "🏥"
+        }
+        
+        # Nếu cung được chỉ định, chỉ hiển thị phân tích cho cung đó
+        if cung and cung in analysis_dict:
+            cung_name = cung_mapping.get(cung, cung)
+            cung_content = analysis_dict.get(cung, "Không có thông tin")
+            
+            formatted_text = f"{cung_emoji.get(cung, '✨')} *{cung_name.upper()}* {cung_emoji.get(cung, '✨')}\n\n"
+            formatted_text += f"👤 *Thông tin*: {day}/{month}/{year}, {birth_time}, {gender}\n\n"
+            formatted_text += f"{cung_content}\n\n"
+            
+            return formatted_text
+        
+        # Nếu không chỉ định cung, hiển thị tổng quan
+        tong_quan = analysis_dict.get("tong_quan", "Không có thông tin tổng quan")
+        
+        # Tạo lời chào thân thiện
+        greeting = random.choice([
+            "Chào bạn! Đây là tử vi của bạn nè:",
+            "Mình đã xem lá số của bạn rồi đây:",
+            "Tử vi của bạn có nhiều điều thú vị:",
+            "Mình đã phân tích lá số của bạn, cùng xem nhé:",
+            "Đây là những điều mình thấy từ lá số của bạn:"
+        ])
+        
+        formatted_text = f"""🔮 *TỬ VI CỦA BẠN* 🔮
 
-{analysis}
+{greeting}
 
-✨ *Phân tích này được thực hiện bởi AIRouter, dựa trên dữ liệu lá số của bạn.*
+📅 *Thông tin của bạn*
+• Ngày sinh: {day}/{month}/{year}
+• Giờ sinh: {birth_time}
+• Giới tính: {gender}
+
+{tong_quan}
+
+✨ *Chọn một cung để xem chi tiết* ✨
 """
         return formatted_text
         
     except Exception as e:
         logger.error(f"Lỗi khi định dạng phân tích: {e}")
-        return analysis  # Trả về phân tích gốc nếu có lỗi
+        if isinstance(analysis_dict, str):
+            return analysis_dict  # Trả về phân tích gốc nếu có lỗi
+        elif isinstance(analysis_dict, dict) and "error" in analysis_dict:
+            return f"❌ *Lỗi khi phân tích*\n\n{analysis_dict['error']}"
+        else:
+            return "Có lỗi xảy ra khi định dạng phân tích. Vui lòng thử lại."
 
 @bot.message_handler(commands=['cancel'])
 def cancel(message):
     """Hủy hội thoại."""
     chat_id = message.chat.id
-    bot.send_message(
-        chat_id,
-        "❌ *Đã hủy thao tác*\n\nGõ /start để bắt đầu lại hoặc /help để xem hướng dẫn.",
-        parse_mode='Markdown'
-    )
+    
+    # Check if user has an active state
     if chat_id in user_states:
+        # Clear all user states
         del user_states[chat_id]
+        
+        bot.send_message(
+            chat_id,
+            "❌ *Đã hủy thao tác*\n\nGõ /start để bắt đầu lại hoặc /help để xem hướng dẫn.",
+            parse_mode='Markdown'
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            "ℹ️ *Không có thao tác nào để hủy*\n\nGõ /start để bắt đầu lập lá số tử vi hoặc /help để xem hướng dẫn.",
+            parse_mode='Markdown'
+        )
 
 @bot.message_handler(commands=['help'])
 def help_command(message):
@@ -1062,7 +1186,7 @@ def process_analysis(chat_id):
     # Gửi thông báo đang phân tích
     processing_msg = bot.send_message(
         chat_id, 
-        "⏳ *Đang phân tích lá số tử vi...*\n\nVui lòng đợi trong giây lát, quá trình này có thể mất 30-60 giây.",
+        "⏳ *Đang xem tử vi cho bạn...*\n\nChờ mình một chút nhé, mình đang xem lá số của bạn...",
         parse_mode='Markdown'
     )
     
@@ -1076,7 +1200,7 @@ def process_analysis(chat_id):
             if chart_path.endswith('.html'):
                 # Thử trích xuất ảnh base64 từ HTML
                 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-                image_path = extract_base64_image_from_html(chart_path, chat_id, user_states[chat_id])
+                image_path = extract_base64_image_from_html(chart_path, timestamp, chat_id, user_states[chat_id])
                 if image_path:
                     chart_path = image_path
                 else:
@@ -1085,7 +1209,13 @@ def process_analysis(chat_id):
                 user_states[chat_id]['chart_image_path'] = chart_path
         
         # Phân tích lá số tử vi
-        analysis = analyze_chart_with_gpt(chart_path, user_states[chat_id])
+        analysis_dict = analyze_chart_with_gpt(chart_path, user_states[chat_id])
+        
+        # Lưu phân tích vào trạng thái người dùng để sử dụng sau này
+        user_states[chat_id]['analysis'] = analysis_dict
+        
+        # Đánh dấu rằng người dùng đã hoàn thành phân tích
+        user_states[chat_id]['analysis_complete'] = True
         
         # Xóa thông báo đang xử lý
         try:
@@ -1093,45 +1223,43 @@ def process_analysis(chat_id):
         except Exception as e:
             logger.warning(f"Không thể xóa tin nhắn 'đang xử lý': {e}")
         
-        # Gửi phân tích cho người dùng
-        # Phân tích có thể dài, cần chia thành nhiều phần nếu vượt quá giới hạn
-        max_length = 4000  # Giới hạn tin nhắn Telegram
+        # Định dạng phân tích tổng quan
+        formatted_analysis = format_analysis(analysis_dict, user_states[chat_id])
         
-        if len(analysis) <= max_length:
-            try:
-                bot.send_message(chat_id, analysis, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"Lỗi khi gửi phân tích: {e}")
-                # Gửi không có định dạng Markdown nếu có lỗi
-                try:
-                    bot.send_message(chat_id, "❌ Không thể hiển thị định dạng đẹp, gửi dạng văn bản thường.")
-                    bot.send_message(chat_id, analysis)
-                except:
-                    bot.send_message(chat_id, "❌ Phân tích quá dài. Vui lòng xem từng phần chi tiết bên dưới.")
-        else:
-            # Chia phân tích thành nhiều phần
-            parts = [analysis[i:i+max_length] for i in range(0, len(analysis), max_length)]
-            for i, part in enumerate(parts):
-                if i == 0:  # Phần đầu tiên
-                    bot.send_message(chat_id, part, parse_mode='Markdown')
-                else:  # Các phần tiếp theo
-                    bot.send_message(chat_id, f"(tiếp theo)...\n\n{part}", parse_mode='Markdown')
-        
-        # Thêm lựa chọn xem chi tiết từng khía cạnh
-        chart_id = save_chart_for_details(chat_id, user_states[chat_id], chart_path)
-        
-        detail_markup = types.InlineKeyboardMarkup(row_width=2)
-        detail_markup.add(
-            types.InlineKeyboardButton("💰 Sự nghiệp & Tài lộc", callback_data=f"detail_career_{chart_id}"),
-            types.InlineKeyboardButton("❤️ Tình duyên & Hôn nhân", callback_data=f"detail_love_{chart_id}"),
-            types.InlineKeyboardButton("🏥 Sức khỏe & Tâm lý", callback_data=f"detail_health_{chart_id}"),
-            types.InlineKeyboardButton("🔑 Phương pháp khai vận", callback_data=f"detail_remedies_{chart_id}")
+        # Gửi phân tích tổng quan cho người dùng
+        bot.send_message(
+            chat_id, 
+            formatted_analysis, 
+            parse_mode='Markdown'
         )
         
+        # Tạo menu các cung
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        
+        # Thêm các nút cho từng cung
+        cung_buttons = [
+            ("👤 Cung Mệnh", "menh"),
+            ("🙏 Cung Phúc Đức", "phuc_duc"),
+            ("💰 Cung Tài Bạch", "tai_bach"),
+            ("💼 Cung Quan Lộc", "quan_loc"),
+            ("💑 Cung Phu Thê", "phu_the"),
+            ("👶 Cung Tử Tức", "tu_tuc"),
+            ("👥 Cung Huynh Đệ", "huynh_de"),
+            ("🏠 Cung Điền Trạch", "dien_trach"),
+            ("✈️ Cung Thiên Di", "thien_di"),
+            ("👨‍👩‍👧‍👦 Cung Nô Bộc", "no_boc"),
+            ("🏥 Cung Tật Ách", "tat_ach")
+        ]
+        
+        # Thêm các nút vào markup
+        for button_text, callback_data in cung_buttons:
+            markup.add(types.InlineKeyboardButton(button_text, callback_data=f"cung_{callback_data}"))
+        
+        # Gửi menu các cung
         bot.send_message(
             chat_id,
-            "👇 *Bạn muốn xem chi tiết về khía cạnh nào?*",
-            reply_markup=detail_markup,
+            "👇 *Chọn một cung để xem chi tiết:*",
+            reply_markup=markup,
             parse_mode='Markdown'
         )
         
@@ -1143,7 +1271,7 @@ def process_analysis(chat_id):
         try:
             bot.send_message(
                 chat_id,
-                "❌ *Đã xảy ra lỗi khi phân tích lá số tử vi*\n\nVui lòng thử lại sau.",
+                f"❌ *Đã xảy ra lỗi khi phân tích lá số tử vi*\n\nLỗi: {str(e)}\n\nVui lòng thử lại sau.",
                 parse_mode='Markdown'
             )
             # Xóa thông báo đang xử lý
@@ -1152,49 +1280,6 @@ def process_analysis(chat_id):
             logger.warning(f"Không thể xóa tin nhắn hoặc gửi thông báo lỗi: {delete_error}")
         # Cập nhật thống kê lỗi
         bot_stats['errors'] += 1
-
-def save_chart_for_details(chat_id, user_data, chart_path):
-    """Lưu thông tin lá số để sử dụng cho chi tiết các khía cạnh"""
-    conn = get_db_connection()
-    if not conn:
-        # Trả về một ID ngẫu nhiên nếu không kết nối được CSDL
-        return str(uuid.uuid4())
-    
-    try:
-        # Lấy base64 image từ file
-        with open(chart_path, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        cursor = conn.cursor()
-        
-        # Lưu vào database nếu chưa có
-        cursor.execute("""
-            INSERT INTO charts (user_id, day, month, year, birth_time, gender, chart_image)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (
-            chat_id, 
-            user_data['day'], 
-            user_data['month'], 
-            user_data['year'], 
-            user_data['birth_time'], 
-            user_data['gender'], 
-            base64_image
-        ))
-        
-        result = cursor.fetchone()
-        chart_id = result[0] if result else str(uuid.uuid4())
-        
-        return chart_id
-    except Exception as e:
-        logger.error(f"Lỗi khi lưu lá số: {e}")
-        return str(uuid.uuid4())  # Trả về ID ngẫu nhiên trong trường hợp lỗi
-    finally:
-        if conn and hasattr(conn, 'close'):
-            try:
-                conn.close()
-            except:
-                pass
 
 def extract_base64_image_from_html(html_path, timestamp, user_id, user_data):
     """
@@ -1345,8 +1430,8 @@ def cleanup_temp_files(max_age_days=7):
             # Kiểm tra tuổi của file
             file_age = current_time - os.path.getmtime(file_path)
             
-            # Xóa file nếu quá cũ
-            if file_age > max_age_seconds:
+            # Xóa file nếu quá cũ hoặc là file tạm (bắt đầu bằng "view_" hoặc "analyze_")
+            if file_age > max_age_seconds or filename.startswith(('view_', 'analyze_')):
                 try:
                     os.remove(file_path)
                     deleted_count += 1
@@ -1377,16 +1462,12 @@ def main():
         # Kiểm tra thư mục
         if not os.path.exists('assets'):
             os.makedirs('assets')
-        if not os.path.exists('assets/charts'):
-            os.makedirs('assets/charts')
-        if not os.path.exists('assets/temp'):
-            os.makedirs('assets/temp')
             
         # Dọn dẹp file tạm cũ khi khởi động
         cleanup_temp_files()
-            
-        # Tạo cơ sở dữ liệu tạm thời nếu cần
-        create_temporary_database()
+        
+        # Lên lịch dọn dẹp định kỳ
+        schedule_cleanup()
         
         # Kiểm tra kết nối cơ sở dữ liệu
         db_conn = get_db_connection()
@@ -1426,68 +1507,6 @@ def main():
         # Thử khởi động lại sau 5 giây
         time.sleep(5)
         main()
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("detail_"))
-def handle_detail_request(call):
-    """Xử lý yêu cầu xem chi tiết về một khía cạnh cụ thể."""
-    chat_id = call.message.chat.id
-    aspect = call.data.split("_")[1]
-    
-    # Gửi thông báo đang phân tích
-    processing_msg = bot.send_message(
-        chat_id, 
-        "⏳ *Đang phân tích chi tiết về {get_aspect_name(aspect)}...*\n\nVui lòng đợi trong giây lát.",
-        parse_mode='Markdown'
-    )
-    
-    try:
-        # Lấy thông tin từ user_data (có thể lưu tạm vào session để tái sử dụng)
-        day = call.message.text.split("Ngày sinh:")[1].split("\n")[0].strip() if "Ngày sinh:" in call.message.text else "không rõ"
-        # Tương tự cho tháng, năm, giờ sinh, giới tính
-        
-        # Phân tích chi tiết bằng AI
-        detailed_analysis = get_detailed_analysis(aspect, day)
-        
-        # Xóa thông báo đang xử lý
-        bot.delete_message(chat_id, processing_msg.message_id)
-        
-        # Gửi phân tích chi tiết
-        bot.send_message(
-            chat_id,
-            detailed_analysis,
-            parse_mode='Markdown'
-        )
-        
-    except Exception as e:
-        logger.error(f"Lỗi khi phân tích chi tiết: {e}")
-        bot.send_message(
-            chat_id,
-            "❌ *Đã xảy ra lỗi khi phân tích chi tiết*\n\nVui lòng thử lại sau.",
-            parse_mode='Markdown'
-        )
-        # Xóa thông báo đang xử lý
-        bot.delete_message(chat_id, processing_msg.message_id)
-
-def get_aspect_name(aspect):
-    """Lấy tên đầy đủ của khía cạnh."""
-    mapping = {
-        "career": "Sự nghiệp",
-        "love": "Tình duyên",
-        "wealth": "Tài lộc",
-        "health": "Sức khỏe"
-    }
-    return mapping.get(aspect, aspect)
-
-def get_detailed_analysis(aspect, day):
-    """Lấy phân tích chi tiết về một khía cạnh cụ thể."""
-    # Phân tích chi tiết bằng AI - tương tự như analyze_chart_with_gpt
-    # ...
-    
-    # Demo return
-    return f"✨ *CHI TIẾT VỀ {get_aspect_name(aspect).upper()}* ✨\n\n" + \
-           f"Đây là phân tích chi tiết về {get_aspect_name(aspect).lower()} cho người sinh ngày {day}.\n\n" + \
-           "• Phân tích chi tiết sẽ được thực hiện dựa trên các sao trong lá số.\n" + \
-           "• Bot đang trong quá trình hoàn thiện tính năng này."
 
 def save_user(user):
     """Lưu thông tin người dùng vào cơ sở dữ liệu"""
@@ -1657,13 +1676,13 @@ def handle_view_chart(call):
         )
         return
     
-    # Lưu ảnh tạm để gửi
-    temp_image_path = f"temp_analysis_{chart_id}.jpg"
-    with open(temp_image_path, 'wb') as f:
+    # Lưu ảnh vào thư mục assets thay vì tạo file tạm
+    image_path = f"assets/view_{chat_id}_{chart_id}.jpg"
+    with open(image_path, 'wb') as f:
         f.write(base64.b64decode(base64_image))
     
     # Gửi ảnh cho người dùng
-    with open(temp_image_path, 'rb') as photo:
+    with open(image_path, 'rb') as photo:
         bot.send_photo(
             chat_id,
             photo,
@@ -1674,8 +1693,11 @@ def handle_view_chart(call):
             parse_mode='Markdown'
         )
     
-    # Xóa file tạm
-    os.remove(temp_image_path)
+    # Xóa file sau khi sử dụng
+    try:
+        os.remove(image_path)
+    except Exception as e:
+        logger.warning(f"Không thể xóa file {image_path}: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("analyze_chart_"))
 def handle_analyze_chart(call):
@@ -1701,6 +1723,8 @@ def handle_analyze_chart(call):
         """, (chart_id,))
         
         chart_data = cursor.fetchone()
+        cursor.close()
+        conn.close()
         
         if not chart_data:
             bot.send_message(
@@ -1711,50 +1735,76 @@ def handle_analyze_chart(call):
             bot.delete_message(chat_id, processing_msg.message_id)
             return
         
-        # Lưu ảnh tạm để phân tích
-        temp_image_path = f"temp_analysis_{chart_id}.jpg"
-        with open(temp_image_path, 'wb') as f:
+        # Lưu ảnh vào thư mục assets thay vì tạo file tạm
+        image_path = f"assets/analyze_{chat_id}_{chart_id}.jpg"
+        with open(image_path, 'wb') as f:
             f.write(base64.b64decode(chart_data['chart_image']))
         
         # Phân tích lá số
-        analysis = analyze_chart_with_gpt(temp_image_path, chart_data)
+        analysis_dict = analyze_chart_with_gpt(image_path, chart_data)
+        
+        # Lưu phân tích vào trạng thái người dùng để sử dụng sau này
+        # Xóa trạng thái cũ nếu có
+        if chat_id in user_states:
+            del user_states[chat_id]
+            
+        # Tạo trạng thái mới với phân tích
+        user_states[chat_id] = {
+            'day': chart_data['day'],
+            'month': chart_data['month'],
+            'year': chart_data['year'],
+            'birth_time': chart_data['birth_time'],
+            'gender': chart_data['gender'],
+            'chart_image_path': image_path,
+            'analysis': analysis_dict,
+            'analysis_complete': True
+        }
         
         # Xóa thông báo đang xử lý
         bot.delete_message(chat_id, processing_msg.message_id)
         
+        # Định dạng phân tích
+        formatted_analysis = format_analysis(analysis_dict, user_states[chat_id])
+        
         # Gửi phân tích cho người dùng
-        # Phân tích có thể dài, cần chia thành nhiều phần nếu vượt quá giới hạn
-        max_length = 4000  # Giới hạn tin nhắn Telegram
-        
-        if len(analysis) <= max_length:
-            bot.send_message(chat_id, analysis, parse_mode='Markdown')
-        else:
-            # Chia phân tích thành nhiều phần
-            parts = [analysis[i:i+max_length] for i in range(0, len(analysis), max_length)]
-            for i, part in enumerate(parts):
-                if i == 0:  # Phần đầu tiên
-                    bot.send_message(chat_id, part, parse_mode='Markdown')
-                else:  # Các phần tiếp theo
-                    bot.send_message(chat_id, f"(tiếp theo)...\n\n{part}", parse_mode='Markdown')
-        
-        # Thêm lựa chọn xem chi tiết từng khía cạnh
-        detail_markup = types.InlineKeyboardMarkup(row_width=2)
-        detail_markup.add(
-            types.InlineKeyboardButton("💰 Sự nghiệp & Tài lộc", callback_data=f"detail_career_{chart_id}"),
-            types.InlineKeyboardButton("❤️ Tình duyên & Hôn nhân", callback_data=f"detail_love_{chart_id}"),
-            types.InlineKeyboardButton("🏥 Sức khỏe & Tâm lý", callback_data=f"detail_health_{chart_id}"),
-            types.InlineKeyboardButton("🔑 Phương pháp khai vận", callback_data=f"detail_remedies_{chart_id}")
-        )
-        
         bot.send_message(
             chat_id,
-            "👇 *Bạn muốn xem chi tiết về khía cạnh nào?*",
-            reply_markup=detail_markup,
+            formatted_analysis,
             parse_mode='Markdown'
         )
         
-        # Xóa file tạm
-        os.remove(temp_image_path)
+        # Tạo menu các cung
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        
+        # Thêm các nút cho từng cung
+        cung_buttons = [
+            ("👤 Cung Mệnh", "menh"),
+            ("🙏 Cung Phúc Đức", "phuc_duc"),
+            ("💰 Cung Tài Bạch", "tai_bach"),
+            ("💼 Cung Quan Lộc", "quan_loc"),
+            ("💑 Cung Phu Thê", "phu_the"),
+            ("👶 Cung Tử Tức", "tu_tuc"),
+            ("👥 Cung Huynh Đệ", "huynh_de"),
+            ("🏠 Cung Điền Trạch", "dien_trach"),
+            ("✈️ Cung Thiên Di", "thien_di"),
+            ("👨‍👩‍👧‍👦 Cung Nô Bộc", "no_boc"),
+            ("🏥 Cung Tật Ách", "tat_ach")
+        ]
+        
+        # Thêm các nút vào markup
+        for button_text, callback_data in cung_buttons:
+            markup.add(types.InlineKeyboardButton(button_text, callback_data=f"cung_{callback_data}"))
+        
+        # Gửi menu các cung
+        bot.send_message(
+            chat_id,
+            "👇 *Chọn một cung để xem chi tiết:*",
+            reply_markup=markup,
+            parse_mode='Markdown'
+        )
+        
+        # Cập nhật thống kê
+        bot_stats['analyses_performed'] += 1
         
     except Exception as e:
         logger.error(f"Lỗi khi phân tích lá số tử vi: {e}")
@@ -1764,7 +1814,21 @@ def handle_analyze_chart(call):
             parse_mode='Markdown'
         )
         # Xóa thông báo đang xử lý
-        bot.delete_message(chat_id, processing_msg.message_id)
+        try:
+            bot.delete_message(chat_id, processing_msg.message_id)
+        except:
+            pass
+        
+        # Cập nhật thống kê lỗi
+        bot_stats['errors'] += 1
+    
+    finally:
+        # Xóa file sau khi sử dụng
+        try:
+            if 'image_path' in locals() and os.path.exists(image_path):
+                os.remove(image_path)
+        except Exception as e:
+            logger.warning(f"Không thể xóa file {image_path}: {e}")
 
 def check_existing_chart(user_id, day, month, year, birth_time, gender):
     """
@@ -1809,7 +1873,7 @@ def check_existing_chart(user_id, day, month, year, birth_time, gender):
             chart_image = result['chart_image']
             
             # Nếu chart_image là base64, cần lưu lại thành file
-            if chart_image and chart_image.startswith('data:image') or len(chart_image) > 200:
+            if chart_image and (chart_image.startswith('data:image') or len(chart_image) > 200):
                 # Đây là base64, cần lưu thành file
                 image_path = f"assets/{user_id}_{chart_id}.jpg"
                 
@@ -1843,6 +1907,106 @@ def check_existing_chart(user_id, day, month, year, birth_time, gender):
     except Exception as e:
         logger.error(f"Lỗi khi kiểm tra lá số tồn tại: {e}")
         return False, None, None
+
+def schedule_cleanup():
+    """Lên lịch dọn dẹp file tạm định kỳ"""
+    import threading
+    
+    def run_cleanup():
+        while True:
+            # Dọn dẹp file tạm mỗi 24 giờ
+            time.sleep(24 * 60 * 60)
+            cleanup_temp_files()
+    
+    # Tạo và khởi động thread dọn dẹp
+    cleanup_thread = threading.Thread(target=run_cleanup)
+    cleanup_thread.daemon = True  # Thread sẽ tự động kết thúc khi chương trình chính kết thúc
+    cleanup_thread.start()
+    logger.info("Đã lên lịch dọn dẹp file tạm định kỳ")
+
+def add_friendly_emojis(text):
+    """
+    Thêm emoji vào phân tích để làm cho nó thân thiện hơn
+    
+    Args:
+        text (str): Văn bản phân tích
+        
+    Returns:
+        str: Văn bản đã thêm emoji
+    """
+    # Danh sách các từ khóa và emoji tương ứng
+    emoji_mapping = {
+        "sự nghiệp": "💼",
+        "công việc": "💼",
+        "tài lộc": "💰",
+        "tiền bạc": "💰",
+        "tình duyên": "❤️",
+        "tình cảm": "❤️",
+        "hôn nhân": "💍",
+        "gia đình": "👨‍👩‍👧‍👦",
+        "sức khỏe": "🏥",
+        "học vấn": "📚",
+        "trí tuệ": "🧠",
+        "may mắn": "🍀",
+        "thành công": "🏆",
+        "thử thách": "🧗",
+        "khó khăn": "🧗",
+        "tương lai": "🔮",
+        "quá khứ": "⏮️",
+        "hiện tại": "⏯️",
+        "lời khuyên": "💡",
+        "nên": "✅",
+        "không nên": "❌",
+        "cẩn thận": "⚠️",
+        "lưu ý": "📝"
+    }
+    
+    # Thêm emoji vào văn bản
+    for keyword, emoji in emoji_mapping.items():
+        # Chỉ thay thế từ khóa khi nó là một từ riêng biệt
+        text = re.sub(r'\b' + keyword + r'\b', f"{keyword} {emoji}", text, flags=re.IGNORECASE)
+    
+    # Thêm emoji vào đầu các đoạn văn
+    lines = text.split('\n')
+    for i in range(len(lines)):
+        # Nếu dòng bắt đầu bằng số hoặc dấu chấm, thêm emoji
+        if re.match(r'^\d+[\.\)]', lines[i].strip()):
+            random_emoji = random.choice(["✨", "🌟", "💫", "🔆", "🌈", "🎯", "🎨", "🎭", "🎬", "🎮", "🎯", "🎪"])
+            lines[i] = f"{random_emoji} {lines[i]}"
+    
+    return '\n'.join(lines)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('cung_'))
+def handle_cung_selection(call):
+    """Xử lý khi người dùng chọn một cung cụ thể để xem phân tích."""
+    chat_id = call.message.chat.id
+    cung_type = call.data  # This will be like 'cung_menh', 'cung_tai_bach', etc.
+    
+    # Kiểm tra xem người dùng có dữ liệu phân tích không
+    if chat_id not in user_states or 'analysis' not in user_states[chat_id]:
+        bot.answer_callback_query(call.id, "Không tìm thấy dữ liệu phân tích. Vui lòng tạo lá số mới.")
+        return
+    
+    # Kiểm tra xem người dùng đã hoàn thành phân tích chưa
+    if 'analysis_complete' not in user_states[chat_id]:
+        bot.answer_callback_query(call.id, "Vui lòng chờ phân tích hoàn tất trước khi xem chi tiết.")
+        return
+    
+    # Lấy dữ liệu phân tích từ trạng thái người dùng
+    analysis_dict = user_states[chat_id]['analysis']
+    
+    # Định dạng phân tích cho cung cụ thể
+    formatted_analysis = format_analysis(analysis_dict, user_states[chat_id], cung=cung_type)
+    
+    # Gửi phân tích cho người dùng
+    bot.send_message(
+        chat_id,
+        formatted_analysis,
+        parse_mode='Markdown'
+    )
+    
+    # Thông báo rằng callback đã được xử lý
+    bot.answer_callback_query(call.id)
 
 if __name__ == "__main__":
     main() 
