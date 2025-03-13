@@ -11,7 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 import telebot
 from telebot import types
-from openai import OpenAI
+import openai
 import base64
 from PIL import Image, ImageDraw, ImageFont
 from selenium import webdriver
@@ -74,10 +74,8 @@ if not os.path.exists('assets'):
 user_chart_counts = {}
 
 # Khởi tạo OpenAI client với AIRouter
-openai_client = OpenAI(
-    base_url="https://api.airouter.io",
-    api_key=AIROUTER_API_KEY
-)
+openai.api_key = AIROUTER_API_KEY
+openai.api_base = "https://api.airouter.io"
 
 # Thêm biến toàn cục để theo dõi thống kê
 bot_stats = {
@@ -353,7 +351,10 @@ def handle_analysis_callbacks(call):
             del user_states[chat_id]
     
     # Acknowledge the callback
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.warning(f"Không thể trả lời callback query: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["male", "female"])
 def handle_gender_selection(call):
@@ -362,7 +363,10 @@ def handle_gender_selection(call):
     
     # Verify the user is in the correct state
     if chat_id not in user_states or 'state' not in user_states[chat_id] or user_states[chat_id]['state'] != WAITING_FOR_BIRTH_TIME:
-        bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        try:
+            bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        except Exception as e:
+            logger.warning(f"Không thể trả lời callback query: {e}")
         return
     
     if call.data == "male":
@@ -374,7 +378,10 @@ def handle_gender_selection(call):
     process_tuvi_chart(chat_id)
     
     # Acknowledge the callback
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.warning(f"Không thể trả lời callback query: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data in ["ty", "suu", "dan", "mao", "thin", "ty_hora", "ngo", "mui", "than", "dau", "tuat", "hoi", "unknown"])
 def handle_birth_time(call):
@@ -383,7 +390,10 @@ def handle_birth_time(call):
     
     # Verify the user is in the correct state
     if chat_id not in user_states or 'state' not in user_states[chat_id] or user_states[chat_id]['state'] != WAITING_FOR_BIRTH_TIME:
-        bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        try:
+            bot.answer_callback_query(call.id, "Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.")
+        except Exception as e:
+            logger.warning(f"Không thể trả lời callback query: {e}")
         return
     
     time_mapping = {
@@ -430,7 +440,10 @@ def handle_birth_time(call):
     )
     
     # Acknowledge the callback
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.warning(f"Không thể trả lời callback query: {e}")
 
 # Replace the old catch-all callback handler with a fallback handler
 @bot.callback_query_handler(func=lambda call: True)
@@ -449,11 +462,14 @@ def handle_other_callbacks(call):
         return
     
     # For any other unhandled callbacks
-    bot.answer_callback_query(
-        call.id,
-        "⚠️ Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.",
-        show_alert=True
-    )
+    try:
+        bot.answer_callback_query(
+            call.id,
+            "⚠️ Yêu cầu không hợp lệ hoặc đã hết hạn. Vui lòng thử lại.",
+            show_alert=True
+        )
+    except Exception as e:
+        logger.warning(f"Không thể trả lời callback query: {e}")
 
 def process_tuvi_chart(chat_id):
     """Xử lý lá số tử vi."""
@@ -923,7 +939,7 @@ def analyze_chart_with_gpt(chart_path, user_data):
         logger.info(f"Đang phân tích lá số cho người sinh ngày {day}/{month}/{year}")
         
         # Gọi API để lấy phân tích
-        response = openai_client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="auto",  # AIRouter sẽ tự chọn mô hình phù hợp
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1382,7 +1398,7 @@ def test_airouter():
     """
     try:
         logger.info("Kiểm tra kết nối AIRouter...")
-        response = openai_client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model="auto",
             messages=[
                 {"role": "system", "content": "Bạn là một trợ lý AI hữu ích."},
@@ -1984,12 +2000,18 @@ def handle_cung_selection(call):
     
     # Kiểm tra xem người dùng có dữ liệu phân tích không
     if chat_id not in user_states or 'analysis' not in user_states[chat_id]:
-        bot.answer_callback_query(call.id, "Không tìm thấy dữ liệu phân tích. Vui lòng tạo lá số mới.")
+        try:
+            bot.answer_callback_query(call.id, "Không tìm thấy dữ liệu phân tích. Vui lòng tạo lá số mới.")
+        except Exception as e:
+            logger.warning(f"Không thể trả lời callback query: {e}")
         return
     
     # Kiểm tra xem người dùng đã hoàn thành phân tích chưa
     if 'analysis_complete' not in user_states[chat_id]:
-        bot.answer_callback_query(call.id, "Vui lòng chờ phân tích hoàn tất trước khi xem chi tiết.")
+        try:
+            bot.answer_callback_query(call.id, "Vui lòng chờ phân tích hoàn tất trước khi xem chi tiết.")
+        except Exception as e:
+            logger.warning(f"Không thể trả lời callback query: {e}")
         return
     
     # Lấy dữ liệu phân tích từ trạng thái người dùng
@@ -2006,7 +2028,10 @@ def handle_cung_selection(call):
     )
     
     # Thông báo rằng callback đã được xử lý
-    bot.answer_callback_query(call.id)
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        logger.warning(f"Không thể trả lời callback query: {e}")
 
 if __name__ == "__main__":
     main() 
